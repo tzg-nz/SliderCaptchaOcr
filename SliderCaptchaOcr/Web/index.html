@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>滑块识别对照</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="toasts" class="toasts"></div>
+  <div class="top">
+    <div class="head">
+      <div class="brand">
+        <h1>滑块识别对照</h1>
+        <p>本地 <code>CapchaImg/{前缀}/</code>，前缀即组名。卡片里可只传背景或滑块，点「识别」才出识别图。</p>
+      </div>
+      <nav class="acts" id="acts"></nav>
+    </div>
+    <details class="note" id="conf-note">
+      <summary>可信、缺口是怎么算的</summary>
+      <div class="note-body">
+        <section>
+          <h3>可信</h3>
+          <p>卡片上的百分比是<strong>最终框位置上的匹配强度</strong>，不是准不准，也不参与选洞。</p>
+          <p>框定下来之后，在该点读三张相关图（归一化互相关，大约 −1～1）：</p>
+          <ul>
+            <li><b>剪影</b>：背景反色 × 滑块形状（暗洞）</li>
+            <li><b>浅色</b>：背景亮度 × 滑块形状（幽灵缺口）</li>
+            <li><b>描边</b>：背景边缘 × 滑块轮廓</li>
+          </ul>
+          <p>取其中大于 0 的最大值，乘 100% 显示。颜色只是分段：≥80% 绿，≥55% 黄，否则红。</p>
+          <p>选洞靠几路指到同一位置。暗区明暗比、整图 Canny、ddddocr 不进入这个数。</p>
+        </section>
+        <section>
+          <h3>缺口</h3>
+          <p>先看滑块图里拆出几块拼图，再在背景上数有没有多出来的覆盖型缺口。多出来的洞要同时满足：</p>
+          <ul>
+            <li>局部比周围明显更暗</li>
+            <li>大小接近拼图块</li>
+            <li>形状比较圆整（树影、字母、色块不算）</li>
+          </ul>
+          <p>计入数量，识别图仍只框滑块对齐的目标，滑动距离也只按这块对齐来算。</p>
+        </section>
+      </div>
+    </details>
+    <div class="tabbar">
+      <nav class="tabs" id="tabs"></nav>
+      <button type="button" class="tab-more hidden" id="tab-more">展开</button>
+    </div>
+  </div>
+  <div class="wrap">
+    <div id="board"></div>
+    <p id="empty" class="empty hidden">还没有本地组。点「添加卡片」，再把图拖进对应的背景或滑块框。</p>
+    <button type="button" class="to-top" id="to-top">回到顶部</button>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

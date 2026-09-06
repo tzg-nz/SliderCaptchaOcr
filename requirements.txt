@@ -1,0 +1,6 @@
+opencv-python
+numpy
+pillow
+
+# 可选：安装后作为兜底算法参与投票
+# ddddocr
