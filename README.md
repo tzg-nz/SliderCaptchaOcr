@@ -3,32 +3,19 @@
 通用滑块验证码缺口识别 + 拟人拖拽轨迹生成。纯 OpenCV 图像匹配，本地运行，不需要联网打码。
 并且可以生成对应可食用轨迹（基于贝赛尔曲线），以及支持本地html打开对比查看
 
-## 效果演示
-
-对照页实际运行效果（拼多多 / 极验4 样本组的缺口识别 + 轨迹预览）：
-
-![对照页效果演示](https://github.com/tzg-nz/SliderCaptchaOcr/releases/download/v1.0.0/demo.jpg)
-
 ## 目录结构
 
 ```
 SliderCaptchaOcr/
-├── README.md
-├── requirements.txt
-└── SliderCaptchaOcr/          # 包目录
-    ├── __init__.py    # 对外入口：recognize / make_trace
-    ├── detector.py    # 缺口识别核心（多路算法投票）
-    ├── trace.py       # 拟人拖拽轨迹生成
-    ├── server.py      # 本地对照页 Web 服务
-    ├── Web/           # 对照页前端（index.html / app.js / style.css）
-    └── CapchaImg/     # 样本库，每组三张图 + meta.json
+├── __init__.py    # 对外入口：recognize / make_trace
+├── detector.py    # 缺口识别核心（多路算法投票）
+├── trace.py       # 拟人拖拽轨迹生成
+├── server.py      # 本地对照页 Web 服务
+├── Web/           # 对照页前端（index.html / app.js / style.css）
+└── CapchaImg/     # 样本库，每组三张图 + meta.json
 ```
 
 ## 依赖
-
-```bash
-pip install -r requirements.txt
-```
 
 - `opencv-python`、`numpy`、`pillow`（必需）
 - `ddddocr`（可选，装了作为兜底算法参与投票，不装也能跑）
@@ -84,7 +71,7 @@ x = recognize(bg, block, save_local=True, tag='geetest_01')
 #   geetest_01_背景.png
 #   geetest_01_滑块.png
 #   geetest_01_识别.png   （画框标注图，识别成功才有）
-#   meta.json             （x / y / n_gaps / conf / error 等结果）
+#   meta.json             （x / y / conf / error 等结果）
 
 # 提供完整原图，启用 diff 算法提高准确率
 x = recognize(bg, block, extra=full_img)
@@ -151,8 +138,7 @@ find_gap_info(bg, block, extra=None)
 | 字段 | 说明 |
 |---|---|
 | `x` / `y` | 滑动距离 / 缺口 y 坐标（识别失败为 `None`） |
-| `n_gaps` | 缺口数量（按图自动判定） |
-| `gaps` | 识别成功的缺口列表（失败的块不进列表）：每条 `{x, y, w, h, method, conf, kind, pad_x, pad_y, ...}`；`kind='piece'` 为滑块块对齐的缺口，`kind='hole'` 为背景上多出来的额外缺口（只计数） |
+| `gaps` | 识别成功的缺口列表（失败的块不进列表）：每条 `{x, y, w, h, method, conf, pad_x, pad_y, ...}`，为滑块块对齐的缺口 |
 | `method` | 命中算法（如 `shadow+rim`，多路投票） |
 | `conf` | 置信度 0~1 |
 | `cands` | 各算法的候选位置列表 |
@@ -166,37 +152,41 @@ from SliderCaptchaOcr.detector import find_gap_info
 
 info = find_gap_info(bg, block)
 if info and info.get('x') is not None:
-    print(info['x'], info['n_gaps'], info['method'], info['conf'])
+    print(info['x'], info['method'], info['conf'])
 else:
     print(info.get('error'))
 ```
 
 ## 识别原理（detector.py）
 
-滑块图按 alpha 通道拆连通域，几块拼图就对应几个缺口。每块拼图在背景上用多路算法独立匹配，x / y 接近（容差 6 / 8 px）的两路以上投票通过才确认：
+滑块图按 alpha 通道拆连通域，几块拼图就对应几个缺口。每块拼图在背景上用多路算法独立匹配，x / y 接近（容差 6 / 8 px）的两路以上投票通过才确认。凑不齐两路时按证据强度取最强一路：置信度优先、同位置旁证加分（旁证按证据族去重：shadow/dark/fill 暗块族、outline/seam 轮廓族、content/ghost/diff 内容族同源只算一票，避免一个证据自吹自擂），算法种类只在分数接近时起次要作用。
 
 | 算法 | 说明 |
 |---|---|
 | shadow | 反色亮度 × 滑块 alpha（暗洞最亮） |
 | rim | 滑块描边对背景亮边（白描边 / 浅色幽灵缺口） |
 | outline | alpha 描边对背景 Canny 边缘 |
+| content | 滑块内容对背景纹理：高通后按 alpha 掩码做归一化互相关。底纹淡、缺口没有暗洞/亮边时只有内部纹理对得上，这路是决定性信号；挖洞渲染抹淡缺口纹理、细尺度分数被压低时，用 σ8 粗结构在同一位置复核加分（粗尺度不独立提名位置，避免重复纹理假峰夺票）；剪影平涂无纹理（每像素 RMS < 4）时自动跳过，避免噪声峰 |
+| ghost | 残影缺口：有些渲染把缺口画成拼图内容的降对比副本（半透明覆盖约 52%，win ≈ a·piece + b），没有暗洞也没有亮边。按物理模型做掩码低通线性拟合，斜率窗 0.40~0.60（真残影聚在 0.5 附近）、r² 作分：自相似纹理块（斜率≈1）、反相暗带（斜率<0）不是这种渲染，按模型排除。同位置暗洞模板分 > 0.10 时让位于暗洞证据（黑块也能拟合出中等斜率），不抢票 |
+| seam | 轮廓阶跃：拼图剪影轮廓带对背景做外法向梯度对齐（边界锐利时大）× 块内反差 × 内部平滑度调制。针对「边界锐利的填充块」渲染大类：缺口处是一整块与周围反差明显、边界干净的块状反常。只在「全图独一份」时出票（主峰/次峰比门控，多峰照片纹理图直接弃权） |
+| fill | 块内反差：剪影内部与外侧带的均值相对差 × 内部平滑度（平涂块压平坦背景不误杀，纹理抹淡的洞压分）。与 seam 同图源的旁证路，同样过独一份门控 |
 | dark | 剪影窗口平均亮度（只作参考，不投票） |
 | ddddocr | 可选兜底（不投票） |
 | diff | 提供完整原图（`extra`）时，与缺口背景做差找洞 |
-| hole | 额外缺口计数：亮边 / 暗剪影 / 描边 / 覆盖块至少两路同时认可才计数，不画框、不参与滑动距离 |
 
-滑动距离只用滑块块对齐的结果，背景上多出来的洞只计数。
+滑动距离只用滑块块对齐的结果。
 
 ## 对照页（server.py）
 
-本地 Web 界面，可视化浏览 / 上传 / 识别 `CapchaImg/` 里的样本。
-
-在仓库根目录（`README.md` 所在层）运行：
+本地 Web 界面，可视化浏览 / 上传 / 识别 `CapchaImg/` 里的样本：
 
 ```bash
 python -m SliderCaptchaOcr                          # 默认 127.0.0.1:8765，自动开浏览器
 python -m SliderCaptchaOcr --port 9000 --no-browser # 指定端口，不开浏览器
 python -m SliderCaptchaOcr --dir D:/some/dir        # 指定图片根目录
 ```
+
+> 把整个 `SliderCaptchaOcr/` 文件夹原样放进别的目录（比如你自己的 `utils/` 下）时，
+> 模块名带上父包即可：`python -m utils.SliderCaptchaOcr`、`from utils.SliderCaptchaOcr import recognize`。
 
 功能：上传背景 / 滑块（可只传一张）、点「识别」出标注图、生成轨迹预览、重命名 / 删除样本组。API 端点：`/api/cases`、`/api/save`、`/api/recognize`、`/api/trace`、`/api/fetch`、`/api/delete`、`/api/rename`。

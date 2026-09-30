@@ -8,12 +8,10 @@
   dark     剪影窗口平均亮度（只作参考，不投票）
   ddddocr  可选兜底
   diff     若提供完整原图（第三张），与缺口背景做差找洞
-  hole     额外缺口：亮边 / 暗剪影 / 描边 / 覆盖块 至少两路同时认，才计数（不画框）
+  seam    轮廓阶跃 × 块内反差（锐利边界填充块，独一份门控）
+  fill    块内反差旁证（与 seam 同图源）
 
-滑块按 alpha 连通域拆块，每块对齐一个缺口。背景上再找「和已对齐那块同类」的洞：
-亮边模板、暗剪影、Canny 描边、覆盖暗块分开提候选，位置靠近的合成一簇，
-两路以上同意才算第二个缺口。单路纹理峰不计。不画框、不参与滑动距离。
-滑动距离只用滑块块对齐的结果。
+滑块按 alpha 连通域拆块，每块对齐一个缺口，滑动距离只用滑块块对齐的结果。
 
 投票：剪影 / 亮边 / 描边局部峰，两票以上 x/y 接近取均值；暗区和 ddddocr 不投票。
 置信过低返回 None，不乱猜。
@@ -688,6 +686,125 @@ def _gap_ddddocr_arr(bg, piece, bg_bytes, y_lo=None, y_hi=None):
         return None, None, 0.0
 
 
+def _gap_content_arr(bg, piece, y_lo=None, y_hi=None):
+    """滑块内容对背景纹理：高通后按 alpha 掩码做归一化互相关。
+
+    拼图内容一般直接从缺口处裁出。缺口没有暗洞/亮边（底纹淡）时，
+    外部对比信号全是噪声，只有内部纹理能对上。剪影是平涂色块时
+    纹理能量过低，直接跳过这路，避免噪声峰参与投票。
+
+    挖洞渲染会把缺口里的纹理抹淡，细尺度（σ2）分数被压到 0.2~0.3，
+    过不了 0.30 的门槛，真票反而被丢掉。峰位置仍以 σ2 细纹理为准，
+    分数取 σ2 与 σ8（粗结构，抗抹淡）在该位置的较大者：粗尺度只给
+    已选位置复核加分、不独立提名位置，避免粗纹理假峰（重复图案、
+    大色块布局）夺票。
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return None, None, 0.0
+    mask = piece[:, :, 3]
+    gh, gw = bg.shape[0], bg.shape[1]
+    ph, pw = mask.shape
+    if ph > gh or pw > gw:
+        return None, None, 0.0
+    m = (mask > 32).astype(np.float32)
+    if float(m.sum()) < 60:
+        return None, None, 0.0
+    gray = cv2.cvtColor(bg, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    pg = cv2.cvtColor(piece[:, :, :3], cv2.COLOR_RGB2GRAY).astype(np.float32)
+
+    def _hp(a, s):
+        return a - cv2.GaussianBlur(a, (0, 0), s)
+
+    tpl = _hp(pg, 2.0) * m
+    energy = float((tpl * tpl).sum()) / float(m.sum())
+    if energy < 16.0:
+        return None, None, 0.0
+
+    def _ncc(g_hp, p_hp):
+        t = p_hp * m
+        num = cv2.matchTemplate(g_hp, t, cv2.TM_CCORR)
+        den = np.sqrt(np.maximum(
+            cv2.matchTemplate(g_hp * g_hp, m, cv2.TM_CCORR), 0.0))
+        nrm = float(np.sqrt((t * t).sum()))
+        return num / (den * nrm + 1e-6)
+
+    res = _ncc(_hp(gray, 2.0), _hp(pg, 2.0))
+    _blank_left(res, _xmin(gw, pw))
+    _apply_y_band(res, y_lo, y_hi, mode='max')
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    x, y = int(max_loc[0]), int(max_loc[1])
+    if not _in_range(x, y, gw, gh, pw, ph) or not _y_ok(y, y_lo, y_hi):
+        return None, None, float(max_val)
+    conf = float(max_val)
+    if conf < 0.30:
+        res8 = _ncc(_hp(gray, 8.0), _hp(pg, 8.0))
+        conf = max(conf, float(res8[y, x]))
+    if conf < 0.30:
+        return None, None, conf
+    return x, y, conf
+
+
+def _gap_ghost_arr(bg, piece, y_lo=None, y_hi=None):
+    """残影缺口：洞内是拼图内容的降对比副本（win ≈ a·piece + b）。
+
+    有些渲染把缺口画成拼图内容的半透明副本（约 52% 覆盖），没有暗洞
+    也没有亮边，外部证据全部失效。按物理模型做掩码低通线性拟合：
+    真残影斜率聚在 0.5 附近，自相似纹理块（斜率≈1）、反相暗带（斜率<0）
+    都不是这种渲染，直接排除——按渲染大类判定，不看具体图。
+    残影证据让位于暗洞证据：同位置暗洞模板分 > 0.10 说明那里是黑块
+    （黑块也能拟合出中等斜率），交给 shadow/dark 路，不抢票。
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return None, None, 0.0
+    mask = piece[:, :, 3]
+    gh, gw = bg.shape[0], bg.shape[1]
+    ph, pw = mask.shape
+    if ph > gh or pw > gw:
+        return None, None, 0.0
+    m = (mask > 32).astype(np.float32)
+    mm = float(m.sum())
+    if mm < 60:
+        return None, None, 0.0
+    gray = cv2.cvtColor(bg, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    pg = cv2.cvtColor(piece[:, :, :3], cv2.COLOR_RGB2GRAY).astype(np.float32)
+    g3 = cv2.GaussianBlur(gray, (0, 0), 3.0)
+    p3 = cv2.GaussianBlur(pg, (0, 0), 3.0)
+    pbar = float((p3 * m).sum()) / mm
+    pt = (p3 - pbar) * m
+    var_p = float((pt * pt).sum())
+    if var_p < 1.0:
+        return None, None, 0.0
+    sw = cv2.matchTemplate(g3, m, cv2.TM_CCORR)
+    sw2 = cv2.matchTemplate(g3 * g3, m, cv2.TM_CCORR)
+    swp = cv2.matchTemplate(g3, pt, cv2.TM_CCORR)
+    var_w = np.maximum(sw2 - sw * sw / mm, 0.0)
+    slope = swp / (var_p + 1e-6)
+    r2 = np.clip(swp * swp / (var_w * var_p + 1e-6), 0.0, 1.0)
+    # 半透明副本的斜率窗 0.40~0.60（实测真残影聚在 0.5 附近），r2 作分数
+    sel = (slope > 0.40) & (slope < 0.60) & (r2 >= 0.12)
+    res = np.where(sel, r2, -1.0).astype(np.float32)
+    _blank_left(res, _xmin(gw, pw))
+    _apply_y_band(res, y_lo, y_hi, mode='max')
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    x, y = int(max_loc[0]), int(max_loc[1])
+    if (max_val <= 0 or not _in_range(x, y, gw, gh, pw, ph)
+            or not _y_ok(y, y_lo, y_hi)):
+        return None, None, 0.0
+    gray8 = cv2.cvtColor(bg, cv2.COLOR_RGB2GRAY)
+    hole = cv2.GaussianBlur(255 - gray8, (5, 5), 0)
+    tpl = cv2.GaussianBlur(mask.astype(np.uint8), (3, 3), 0)
+    sh = cv2.matchTemplate(hole, tpl, cv2.TM_CCOEFF_NORMED)
+    if float(sh[y, x]) > 0.10:
+        return None, None, 0.0
+    return x, y, float(min(0.99, float(max_val) ** 0.5))
+
+
 def _gap_diff_arr(bg, full, piece, y_lo=None, y_hi=None):
     """完整原图 - 缺口背景 = 洞。洞的位置再和拼图剪影对一下。"""
     try:
@@ -717,6 +834,128 @@ def _gap_diff_arr(bg, full, piece, y_lo=None, y_hi=None):
             or max_val < 0.20):
         return None, None, float(max_val)
     return x, y, float(max_val)
+
+
+def _fill_block_maps(bg, piece):
+    """锐利边界填充块：轮廓阶跃图 + 块内反差图（渲染大类，不认厂商）。
+
+    拼图剪影轮廓带（md）上做「外法向梯度对齐」得 step（边界锐利时大）；
+    内部（mi）与外侧带（mo）的均值相对差为 fill，再按内部平滑度调制
+    smooth。smooth 用加性比值 (out_s+3)/(win_s+3)：平涂块压在平坦背景
+    上得 1 不被误杀，纹理被抹淡的洞内部平滑度低、反被压分。
+    seam = step×fill×smooth 判「边界锐利的块状反常」；fill×smooth 单独
+    判「块内外反差」。两者都要配合 _peak_dominance 的独一份门控才出票。
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return None, None
+    mask = piece[:, :, 3]
+    gh, gw = bg.shape[0], bg.shape[1]
+    ph, pw = mask.shape
+    if ph > gh or pw > gw:
+        return None, None
+    m = (mask > 32).astype(np.float32)
+    if float(m.sum()) < 60:
+        return None, None
+    gray = cv2.cvtColor(bg, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    k3 = np.ones((3, 3), np.uint8)
+    md = (cv2.dilate(m, k3) - cv2.erode(m, k3)).astype(np.float32)
+    mo = (cv2.dilate(m, k3, iterations=2) - cv2.dilate(m, k3)).astype(np.float32)
+    mi = cv2.erode(m, k3).astype(np.float32)
+    if float(md.sum()) < 20 or float(mi.sum()) < 20:
+        return None, None
+    gf = cv2.GaussianBlur(gray, (0, 0), 1.2)
+    ms = cv2.GaussianBlur(m, (0, 0), 1.0)
+    nmx = -cv2.Sobel(ms, cv2.CV_32F, 1, 0)
+    nmy = -cv2.Sobel(ms, cv2.CV_32F, 0, 1)
+    nmag = cv2.magnitude(nmx, nmy) + 1e-6
+    bx = (nmx / nmag * md).astype(np.float32)
+    by = (nmy / nmag * md).astype(np.float32)
+    step = np.abs(cv2.matchTemplate(cv2.Sobel(gf, cv2.CV_32F, 1, 0), bx, cv2.TM_CCORR)
+                  + cv2.matchTemplate(cv2.Sobel(gf, cv2.CV_32F, 0, 1), by, cv2.TM_CCORR))
+    step /= (float(md.sum()) + 1e-6)
+
+    def _mean(img, w):
+        return cv2.matchTemplate(img, w, cv2.TM_CCORR) / (float(w.sum()) + 1e-6)
+
+    win_m = _mean(gray, mi)
+    out_m = _mean(gray, mo)
+    fill = np.abs(win_m - out_m) / (np.abs(out_m) + 4.0)
+    g2 = gray * gray
+    win_s = np.sqrt(np.maximum(_mean(g2, mi) - win_m * win_m, 0.0))
+    out_s = np.sqrt(np.maximum(_mean(g2, mo) - out_m * out_m, 0.0))
+    smooth = (out_s + 3.0) / (win_s + 3.0)
+    fs = fill * np.clip(smooth, 0.0, 2.0)
+    return step * fs, fs
+
+
+def _peak_dominance(res, gw, gh, pw, ph, y_lo, y_hi, raw_floor, scale):
+    """允许域内取主峰，按「峰/次峰比」做独一份门控。
+
+    全图独一份的块状反常才是真缺口签名；照片物体、纹理产生的多峰图
+    直接弃权。dominance = clip((峰/次峰 − 1.5)/2, 0, 1)，
+    conf = min(0.99, raw/scale)×dominance，低于 0.10 不出票。
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return None, None, 0.0
+    r = np.array(res, dtype=np.float32, copy=True)
+    _blank_left(r, _xmin(gw, pw))
+    _apply_y_band(r, y_lo, y_hi, mode='max')
+    dist = 20
+    peaks = []
+    work = r.copy()
+    for _ in range(2):
+        _mn, mv, _ml, ml = cv2.minMaxLoc(work)
+        x, y = int(ml[0]), int(ml[1])
+        if mv <= -1e8:
+            break
+        peaks.append((float(mv), x, y))
+        work[max(0, y - dist):y + dist + 1, max(0, x - dist):x + dist + 1] = -9e9
+    if not peaks:
+        return None, None, 0.0
+    mv, x, y = peaks[0]
+    if mv < raw_floor or not _in_range(x, y, gw, gh, pw, ph) or not _y_ok(y, y_lo, y_hi):
+        return None, None, 0.0
+    peak2 = peaks[1][0] if len(peaks) > 1 else 0.0
+    ratio = mv / max(peak2, 1e-3)
+    dom = max(0.0, min(1.0, (ratio - 1.5) / 2.0))
+    conf = min(0.99, mv / float(scale)) * dom
+    if conf < 0.10:
+        return None, None, 0.0
+    return x, y, float(min(0.99, conf))
+
+
+def _gap_seam_arr(bg, piece, y_lo=None, y_hi=None):
+    """轮廓阶跃 seam：边界锐利的填充块在缺口处留下的块状反常。
+
+    raw_floor=25、scale=120（实测真值 J≈50~340，照片假峰 ≤80 且不独
+    一份）；只有主峰/次峰比够大时出票，多峰图弃权。
+    """
+    jmap, _fs = _fill_block_maps(bg, piece)
+    if jmap is None:
+        return None, None, 0.0
+    ph, pw = piece.shape[0], piece.shape[1]
+    return _peak_dominance(jmap, bg.shape[1], bg.shape[0], pw, ph,
+                           y_lo, y_hi, 25.0, 120.0)
+
+
+def _gap_fill_arr(bg, piece, y_lo=None, y_hi=None):
+    """块内反差 fill：拼图剪影处内外均值反差（锐利填充块大类的旁证）。
+
+    与 seam 同图源，只看块状反差不看阶跃；raw_floor=0.30、scale=0.8，
+    同样过独一份门控，避免照片纹理块参与投票。
+    """
+    _jmap, fs = _fill_block_maps(bg, piece)
+    if fs is None:
+        return None, None, 0.0
+    ph, pw = piece.shape[0], piece.shape[1]
+    return _peak_dominance(fs, bg.shape[1], bg.shape[0], pw, ph,
+                           y_lo, y_hi, 0.30, 0.8)
 
 
 def _lock_conf(raw, n_lock):
@@ -763,24 +1002,53 @@ def _agree(xs, tol=6, ytol=8):
     return None
 
 
+_METHOD_BONUS = {
+    'diff': 0.05, 'content': 0.04, 'ghost': 0.04,
+    'rim': 0.02, 'shadow': 0.02, 'outline': 0.01,
+    'seam': 0.02, 'fill': 0.02,
+}
+
+# 证据族：shadow/dark/fill 同源（都是块内外反差），content/ghost/diff 同源
+# （照片内容），outline/seam 同源（轮廓边界）。同族多路命中只算一票旁证，
+# 避免一个证据自吹自擂。
+_METHOD_FAMILY = {
+    'shadow': 'dark', 'dark': 'dark', 'fill': 'dark',
+    'rim': 'rim', 'outline': 'edge', 'seam': 'edge',
+    'content': 'content', 'ghost': 'content', 'diff': 'content',
+}
+
+
 def _pick_best(xs):
+    """没有两路共识时按证据强度取最强：置信度优先，同位置旁证加分。
+
+    方法本身只做很小的加权（只在分数接近时起作用）。以前按方法分层
+    再比置信度，弱 rim 0.28 会压过强 shadow 0.70，导致选到错误的洞。
+    """
     if not xs:
         return None
     pool = [v for v in xs
             if str(v[0]) != 'dark' and 'dddd' not in str(v[0])]
     if not pool:
         pool = list(xs)
-    pool = list(pool)
-    pool.sort(key=lambda v: (
-        0 if v[0] == 'diff' and v[3] >= 0.35 else
-        1 if v[0] == 'rim' and v[3] >= 0.28 else
-        2 if v[0] == 'shadow' and v[3] >= 0.40 else
-        3 if v[0] == 'outline' and v[3] >= 0.18 else
-        4 if v[0] == 'dark' and v[3] >= 0.45 else
-        5 if v[0] == 'ddddocr' else 6,
-        -v[3]))
-    m, x, y, c = pool[0]
-    if m in ('shadow', 'dark', 'outline', 'diff', 'rim') and c < 0.18:
+
+    def support(x, y):
+        fams = set()
+        for _m, xx, yy, c in xs:
+            if xx is None or yy is None:
+                continue
+            if (abs(int(xx) - int(x)) <= 6 and abs(int(yy) - int(y)) <= 8
+                    and c is not None and float(c) > 0.20):
+                fams.add(_METHOD_FAMILY.get(str(_m).split(':')[-1], str(_m)))
+        return len(fams)
+
+    def score(v):
+        m, x, y, c = v
+        return (float(c or 0) + 0.10 * (support(x, y) - 1)
+                + _METHOD_BONUS.get(str(m).split(':')[-1], 0.0))
+
+    m, x, y, c = max(pool, key=score)
+    if m in ('shadow', 'dark', 'outline', 'diff', 'rim', 'content', 'ghost',
+             'seam', 'fill') and float(c or 0) < 0.18:
         return None
     return {'x': int(x), 'y': int(y), 'method': m, 'conf': float(c)}
 
@@ -791,7 +1059,13 @@ def _match_piece(bg, piece, bg_bytes=None, full=None, y_lo=None, y_hi=None):
         ('shadow', _gap_shadow_arr),
         ('rim', _gap_rim_arr),
         ('outline', _gap_outline_arr),
+        ('content', _gap_content_arr),
         ('dark', _gap_dark_arr),
+        ('ghost', _gap_ghost_arr),
+        # seam/fill 挂在表尾：_agree 按池顺序取第一个 ≥2 路共识簇，
+        # 既有证据簇优先，新路只在无共识时决断，不抢既有票。
+        ('seam', _gap_seam_arr),
+        ('fill', _gap_fill_arr),
     ):
         x, y, c = fn(bg, piece, y_lo=y_lo, y_hi=y_hi)
         if x is not None:
@@ -821,395 +1095,6 @@ def _near(ax, ay, bx, by, rad):
     return (int(ax) - int(bx)) ** 2 + (int(ay) - int(by)) ** 2 <= int(rad) ** 2
 
 
-def _hole_heatmap(gray, pw, ph, pad=5):
-    """outer 环均值 - inner 块均值：拼图大小的暗洞得分高。"""
-    import cv2
-    import numpy as np
-    g = gray.astype(np.float32)
-    inner = np.zeros((ph, pw), np.float32)
-    ix, iy = max(3, pw // 8), max(3, ph // 8)
-    inner[iy:ph - iy, ix:pw - ix] = 1.0
-    s = float(inner.sum())
-    if s < 8:
-        return None, pad
-    inner /= s
-    ow, oh = pw + pad * 2, ph + pad * 2
-    ring = np.ones((oh, ow), np.float32)
-    ring[pad:pad + ph, pad:pad + pw] = 0
-    rs = float(ring.sum())
-    if rs < 8:
-        return None, pad
-    ring /= rs
-    inn = cv2.matchTemplate(g, inner, cv2.TM_CCORR)
-    out = cv2.matchTemplate(g, ring, cv2.TM_CCORR)
-    dh = inn.shape[0] - out.shape[0]
-    dw = inn.shape[1] - out.shape[1]
-    if dh < 0 or dw < 0:
-        return None, pad
-    inn_c = inn[dh // 2:inn.shape[0] - (dh - dh // 2),
-                  dw // 2:inn.shape[1] - (dw - dw // 2)]
-    h = min(inn_c.shape[0], out.shape[0])
-    w = min(inn_c.shape[1], out.shape[1])
-    return out[:h, :w] - inn_c[:h, :w], pad
-
-
-def _nms_map(res, ph, pw, k=8, xmin=0):
-    import cv2
-    if res is None or res.size == 0:
-        return []
-    work = res.copy()
-    if xmin > 0:
-        work[:, :max(0, int(xmin))] = -1e9
-    hits = []
-    rad = max(8, int(0.7 * max(ph, pw)))
-    for _ in range(k):
-        _mn, mv, _ml, ml = cv2.minMaxLoc(work)
-        if mv < -1e8:
-            break
-        x, y = int(ml[0]), int(ml[1])
-        hits.append((float(mv), x, y))
-        work[max(0, y - rad):y + rad, max(0, x - rad):x + rad] = -1e9
-    return hits
-
-
-def _tighten_hole(gray, x, y, pw, ph):
-    """用窗口里最暗的连通域把框收紧到洞本身。"""
-    import cv2
-    import numpy as np
-    gh, gw = gray.shape
-    pad = max(6, min(pw, ph) // 6)
-    x0, y0 = max(0, int(x) - pad), max(0, int(y) - pad)
-    x1, y1 = min(gw, int(x) + pw + pad), min(gh, int(y) + ph + pad)
-    win = gray[y0:y1, x0:x1]
-    if win.size < 40:
-        return int(x), int(y), int(pw), int(ph)
-    blur = cv2.GaussianBlur(win, (11, 11), 0)
-    mask = (blur.astype(np.int16) - win.astype(np.int16) > 10).astype(np.uint8)
-    n, _lab, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    best = None
-    area0 = max(80, int(pw * ph * 0.22))
-    cx, cy = (int(x) - x0) + pw // 2, (int(y) - y0) + ph // 2
-    for i in range(1, n):
-        bx, by, bw, bh, area = (int(v) for v in stats[i])
-        if area < area0 or bw < 14 or bh < 14:
-            continue
-        if bw > pw * 1.7 or bh > ph * 1.7:
-            continue
-        dist = abs(bx + bw / 2 - cx) + abs(by + bh / 2 - cy)
-        key = (dist, -area)
-        if best is None or key < best[0]:
-            best = (key, bx, by, bw, bh)
-    if not best:
-        return int(x), int(y), int(pw), int(ph)
-    _k, bx, by, bw, bh = best
-    return x0 + bx, y0 + by, bw, bh
-
-
-def _inner_mean(gray, x, y, pw, ph):
-    ix, iy = max(2, pw // 8), max(3, ph // 8)
-    win = gray[y:y + ph, x:x + pw]
-    core = win[iy:ph - iy, ix:pw - ix]
-    if core.size == 0:
-        return float(win.mean())
-    return float(core.mean())
-
-
-def _find_bg_holes(bg, pw, ph, xmin, occupied):
-    """背景上找拼图大小的暗洞。不看厂商，只看图。
-
-    真缺口 = 比周围明显暗（边界对比 hm 高）且本身够暗（inner 低）的拼图大小区域。
-    只在这里数暗洞；浅色轮廓类的洞由滑块匹配负责，避免把背景纹理当成洞。
-    返回的每个洞带 score（边界对比强度），供调用方按相对强度再筛一遍。
-    """
-    try:
-        import cv2
-    except Exception:
-        return []
-    if pw < 16 or ph < 16:
-        return []
-    gray = cv2.cvtColor(bg, cv2.COLOR_RGB2GRAY)
-    hm, pad = _hole_heatmap(gray, pw, ph)
-    if hm is None:
-        return []
-    rad = max(12, int(0.65 * max(pw, ph)))
-    used = list(occupied)
-    holes = []
-    for score, hx, hy in _nms_map(hm, ph, pw, k=8, xmin=max(0, int(xmin) - pad)):
-        x, y = int(hx) + pad, int(hy) + pad
-        if x < 0 or y < 0 or x + pw > gray.shape[1] or y + ph > gray.shape[0]:
-            continue
-        if any(_near(x, y, ox, oy, rad) for ox, oy, _ow, _oh in used):
-            continue
-        inner = _inner_mean(gray, x, y, pw, ph)
-        if score < 40 or inner > 95:
-            continue
-        tx, ty, tw, th = _tighten_hole(gray, x, y, pw, ph)
-        holes.append({
-            'x': int(tx), 'y': int(ty), 'w': int(tw), 'h': int(th),
-            'conf': float(min(0.99, 0.35 + score / 200.0)),
-            'method': 'hole', 'kind': 'hole', 'score': float(score),
-        })
-        used.append((int(tx), int(ty), int(tw), int(th)))
-    return holes
-
-
-def _find_overlay_holes(bg, pw, ph, xmin, occupied):
-    """背景上局部变暗、尺寸接近拼图、比较圆整的覆盖块。
-
-    验证码缺口是盖在照片上的半透明块，四周比洞内亮；树影和字母形状碎、圆整度低。
-    只用来计数，不参与选滑动目标。
-    """
-    try:
-        import cv2
-        import numpy as np
-    except Exception:
-        return []
-    pw, ph = int(pw), int(ph)
-    if pw < 16 or ph < 16:
-        return []
-    gray = cv2.cvtColor(bg, cv2.COLOR_RGB2GRAY)
-    loc = cv2.GaussianBlur(gray, (21, 21), 0)
-    dark = ((loc.astype(np.int16) - gray.astype(np.int16)) > 12).astype(np.uint8) * 255
-    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, k3)
-    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, k5, iterations=2)
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(dark)
-    rad = max(12, int(0.55 * max(pw, ph)))
-    holes = []
-    for i in range(1, n):
-        x, y, w, h, area = (int(v) for v in stats[i])
-        if x < int(xmin):
-            continue
-        if not (0.40 * pw <= w <= 1.65 * pw and 0.40 * ph <= h <= 1.65 * ph):
-            continue
-        ar = w / float(h)
-        if ar < 0.55 or ar > 1.75:
-            continue
-        if area < 0.18 * pw * ph or area > 1.5 * pw * ph:
-            continue
-        if area / float(w * h) < 0.30:
-            continue
-        mask = (labels == i).astype(np.uint8) * 255
-        ring = cv2.subtract(cv2.dilate(mask, k3, iterations=2), mask)
-        inner = gray[mask > 0]
-        outer = gray[ring > 0]
-        if inner.size < 30 or outer.size < 20:
-            continue
-        if float(outer.mean()) - float(inner.mean()) < 18:
-            continue
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            continue
-        peri = cv2.arcLength(cnts[0], True)
-        circ = 4.0 * np.pi * area / (peri * peri + 1e-6)
-        if circ < 0.20:
-            continue
-        if any(_near(x, y, ox, oy, rad) for ox, oy, _ow, _oh in occupied):
-            continue
-        holes.append({
-            'x': x, 'y': y, 'w': w, 'h': h,
-            'method': 'overlay', 'conf': float(circ),
-            'cands': [], 'kind': 'hole', 'pad_x': 0, 'pad_y': 0,
-        })
-    return holes
-
-
-def _ncc_peaks(res, xmin, rad, k=6, floor=0.10):
-    """NCC 图上取互不重叠的峰。"""
-    import cv2
-    if res is None or res.size == 0:
-        return []
-    work = res.copy()
-    if xmin > 0:
-        work[:, :max(0, int(xmin))] = -1
-    out = []
-    for _ in range(k):
-        _, mv, _, ml = cv2.minMaxLoc(work)
-        if mv < floor:
-            break
-        x, y = int(ml[0]), int(ml[1])
-        out.append((x, y, float(mv)))
-        work[max(0, y - rad):y + rad + 1, max(0, x - rad):x + rad + 1] = -1
-    return out
-
-
-def _rim_hit_frac(rim, outline, x, y):
-    """拼图描边落在背景亮边上的比例。纹理峰这项会明显低于真洞。"""
-    ph, pw = outline.shape
-    gh, gw = rim.shape[:2]
-    x, y = int(x), int(y)
-    if x < 0 or y < 0 or x + pw > gw or y + ph > gh:
-        return 0.0
-    ring = outline > 0
-    if int(ring.sum()) < 10:
-        return 0.0
-    win = rim[y:y + ph, x:x + pw]
-    return float((win[ring] > 0).mean())
-
-
-def _ring_delta(gray, alpha, x, y):
-    """洞外一圈均值 − 剪影内均值。正数=洞内更暗。"""
-    import numpy as np
-    ph, pw = alpha.shape
-    gh, gw = gray.shape[:2]
-    x, y = int(x), int(y)
-    if x < 0 or y < 0 or x + pw > gw or y + ph > gh:
-        return 0.0
-    solid = alpha > 32
-    win = gray[y:y + ph, x:x + pw]
-    inner = float(win[solid].mean()) if solid.any() else 0.0
-    pad = 3
-    y0, x0 = max(0, y - pad), max(0, x - pad)
-    y1, x1 = min(gh, y + ph + pad), min(gw, x + pw + pad)
-    ring = np.ones((y1 - y0, x1 - x0), np.uint8)
-    ring[y - y0:y - y0 + ph, x - x0:x - x0 + pw][solid] = 0
-    pix = gray[y0:y1, x0:x1][ring > 0]
-    outer = float(pix.mean()) if pix.size else inner
-    return outer - inner
-
-
-def _find_rim_holes(bg, piece, xmin, occupied):
-    """兼容旧名，转到多路投票。"""
-    return _find_extra_holes(bg, piece, xmin, occupied)
-
-
-def _find_extra_holes(bg, piece, xmin, occupied):
-    """背景上再数缺口：多路提候选，两路同意才算。
-
-    通病不是某一张图，是「亮边模板 + 绝对阈值 0.32」：
-    真第二洞经常只有 0.34，差 0.02 就漏计；几何纹理的弱峰又会被算进去。
-    改成和滑块匹配同一套思路：亮边 / 暗剪影 / Canny / 覆盖块分开看，
-    位置靠近合成一簇，至少两路认才计数。亮边全局都很弱时（没有白圈）
-    亮边这一路直接关掉，避免把色块当第二洞。
-    """
-    try:
-        import cv2
-        import numpy as np
-    except Exception:
-        return []
-    ph, pw = int(piece.shape[0]), int(piece.shape[1])
-    gh, gw = bg.shape[0], bg.shape[1]
-    if pw < 16 or ph < 16 or ph > gh or pw > gw:
-        return []
-    outline = _piece_outline(piece)
-    if int(outline.max() or 0) == 0:
-        return []
-    gray = cv2.cvtColor(bg, cv2.COLOR_RGB2GRAY)
-    rim = _bg_rim(bg)
-    alpha = piece[:, :, 3]
-    hole = cv2.GaussianBlur(255 - gray, (5, 5), 0)
-    tpl = cv2.GaussianBlur(alpha, (3, 3), 0)
-    xmin = int(xmin)
-    rim_map = cv2.matchTemplate(rim, outline, cv2.TM_CCOEFF_NORMED)
-    _blank_left(rim_map, xmin)
-    sh_map = cv2.matchTemplate(hole, tpl, cv2.TM_CCOEFF_NORMED)
-    _blank_left(sh_map, xmin)
-    out_map = cv2.matchTemplate(
-        cv2.Canny(gray, 60, 140), outline, cv2.TM_CCOEFF_NORMED)
-    _blank_left(out_map, xmin)
-    rad = max(12, int(0.55 * max(pw, ph)))
-    overlays = _find_overlay_holes(bg, pw, ph, xmin, occupied)
-
-    seeds = []
-    for x, y, c in _ncc_peaks(rim_map, xmin, rad):
-        seeds.append({'x': x, 'y': y, 'rim': c, 'sh': -1.0, 'out': -1.0,
-                      'ov': False, 'circ': 0.0})
-    for x, y, c in _ncc_peaks(sh_map, xmin, rad):
-        seeds.append({'x': x, 'y': y, 'rim': -1.0, 'sh': c, 'out': -1.0,
-                      'ov': False, 'circ': 0.0})
-    for x, y, c in _ncc_peaks(out_map, xmin, rad):
-        seeds.append({'x': x, 'y': y, 'rim': -1.0, 'sh': -1.0, 'out': c,
-                      'ov': False, 'circ': 0.0})
-    for h in overlays:
-        seeds.append({'x': int(h['x']), 'y': int(h['y']),
-                      'rim': -1.0, 'sh': -1.0, 'out': -1.0,
-                      'ov': True, 'circ': float(h.get('conf') or 0)})
-
-    def _score(s):
-        return max(s['rim'], s['sh'], s['out'], 0.40 if s['ov'] else -1.0)
-
-    clusters = []
-    for s in seeds:
-        hit = None
-        for cl in clusters:
-            if _near(s['x'], s['y'], cl['x'], cl['y'], rad):
-                hit = cl
-                break
-        if hit is None:
-            clusters.append(dict(s))
-            continue
-        if _score(s) > _score(hit):
-            hit['x'], hit['y'] = s['x'], s['y']
-        hit['rim'] = max(hit['rim'], s['rim'])
-        hit['sh'] = max(hit['sh'], s['sh'])
-        hit['out'] = max(hit['out'], s['out'])
-        hit['ov'] = hit['ov'] or s['ov']
-        hit['circ'] = max(hit['circ'], s['circ'])
-
-    if not clusters:
-        return []
-    ox = oy = None
-    if occupied:
-        ox, oy = occupied[0][0], occupied[0][1]
-    ref_sup = _rim_hit_frac(rim, outline, ox, oy) if occupied else 0.0
-    ref_dlt = _ring_delta(gray, alpha, ox, oy) if occupied else 0.0
-    best_rim = max(cl['rim'] for cl in clusters)
-    best_sh = max(cl['sh'] for cl in clusters)
-    best_out = max(cl['out'] for cl in clusters)
-
-    def contrast_ok(dlt):
-        if ref_dlt > 8:
-            return dlt > 4
-        if ref_dlt < -8:
-            return dlt < -4
-        return True
-
-    holes = []
-    used = list(occupied)
-    for cl in clusters:
-        x, y = int(cl['x']), int(cl['y'])
-        if 0 <= y < rim_map.shape[0] and 0 <= x < rim_map.shape[1]:
-            cl['rim'] = max(cl['rim'], float(rim_map[y, x]))
-            cl['sh'] = max(cl['sh'], float(sh_map[y, x]))
-            cl['out'] = max(cl['out'], float(out_map[y, x]))
-        if any(_near(x, y, a, b, rad) for a, b, _w, _h in used):
-            continue
-        if not _in_range(x, y, gw, gh, pw, ph):
-            continue
-        sup = _rim_hit_frac(rim, outline, x, y)
-        dlt = _ring_delta(gray, alpha, x, y)
-        votes = 0
-        methods = []
-        if (best_rim >= 0.28 and cl['rim'] >= max(0.22, 0.70 * best_rim)
-                and sup >= 0.65 * (ref_sup or 0.01) and contrast_ok(dlt)):
-            votes += 1
-            methods.append('rim')
-        if (best_sh >= 0.35 and cl['sh'] >= max(0.25, 0.55 * best_sh)
-                and dlt > 5):
-            votes += 1
-            methods.append('shadow')
-        if (best_out >= 0.18 and cl['out'] >= max(0.12, 0.70 * best_out)
-                and contrast_ok(dlt)):
-            votes += 1
-            methods.append('outline')
-        if cl['ov']:
-            votes += 1
-            methods.append('overlay')
-            if dlt >= 25 and cl['circ'] >= 0.22:
-                votes += 1
-        if votes < 2:
-            continue
-        holes.append({
-            'x': x, 'y': y, 'w': pw, 'h': ph,
-            'method': '+'.join(methods) or 'hole',
-            'conf': float(max(cl['rim'], cl['sh'], cl['out'], cl['circ'])),
-            'cands': [], 'kind': 'hole', 'pad_x': 0, 'pad_y': 0,
-        })
-        used.append((x, y, pw, ph))
-    return holes
-
-
 def _load_full(extra):
     if extra is None:
         return None
@@ -1223,7 +1108,7 @@ def _load_full(extra):
 
 
 def find_gap_info(bg, block, extra=None):
-    """返回 {x, y, n_gaps, gaps, method, conf, cands, pad_x} 或 None。
+    """返回 {x, y, gaps, method, conf, cands, pad_x} 或 None。
 
     gaps: 每个缺口一块 {x, y, w, h, method, conf, pad_x, pad_y}
     x 是滑动距离（背景图像素，滑块图左缘对齐后的缺口左缘）。
@@ -1237,13 +1122,13 @@ def _find_gap_info_run(bg, block, extra=None):
     bad = _pair_problem(bg_bytes, block_bytes)
     if bad:
         return {
-            'x': None, 'y': None, 'n_gaps': None, 'gaps': [],
+            'x': None, 'y': None, 'gaps': [],
             'method': None, 'conf': 0.0, 'cands': [], 'error': bad,
         }
     pair = _load_pair(bg_bytes, block_bytes)
     if not pair:
         return {
-            'x': None, 'y': None, 'n_gaps': None, 'gaps': [],
+            'x': None, 'y': None, 'gaps': [],
             'method': None, 'conf': 0.0, 'cands': [],
             'error': '无法识别缺口',
         }
@@ -1283,17 +1168,6 @@ def _find_gap_info_run(bg, block, extra=None):
         inferred.append((gx - p['x0'] + crop_x0, gy - p['y0'] + crop_y0,
                          hit.get('conf') or 0.0, hit.get('method')))
 
-    occupied = [(g['x'], g['y'], g.get('w') or 0, g.get('h') or 0)
-                for g in gaps if g.get('x') is not None]
-    extras = []
-    if occupied:
-        extras = _find_extra_holes(
-            bg_arr, pieces[0]['piece'],
-            _xmin(bg_arr.shape[1], pieces[0]['w']), occupied)
-    for hole in extras:
-        hole['i'] = len(gaps)
-        gaps.append(hole)
-
     # 整块剪影再投一票。单缺口时和唯一那块重复，不再投，避免把错误结果加一票。
     y_lo_c, y_hi_c = _y_band(sl_h, bg_h, combined.shape[0], crop_y0)
     comb = _match_piece(bg_arr, combined, bg_bytes=bg_bytes, full=full,
@@ -1310,26 +1184,18 @@ def _find_gap_info_run(bg, block, extra=None):
     if not hit and comb.get('x') is not None:
         hit = {'x': comb['x'], 'y': comb['y'],
                'method': comb.get('method'), 'conf': comb.get('conf')}
-    n_piece_ok = sum(1 for g in gaps
-                      if g.get('x') is not None and g.get('kind') != 'hole')
-    n_gaps = len(pieces) + sum(1 for g in gaps if g.get('kind') == 'hole')
-    if not n_gaps:
-        n_gaps = len(pieces)
-    if not hit and n_piece_ok == 0:
+    if not hit and not gaps:
         out = {
-            'x': None, 'y': None, 'n_gaps': n_gaps, 'gaps': gaps,
+            'x': None, 'y': None, 'gaps': gaps,
             'method': None, 'conf': 0.0, 'cands': comb.get('cands') or [],
             'pad_x': crop_x0, 'pad_y': crop_y0,
             'error': '无法识别缺口',
         }
         return _fill_trace_pose(out, pieces, bg_arr)
 
-    # 没共识时，用已识别滑块块里置信最高的换算（背景多出来的洞不参与滑动距离）
+    # 没共识时，用已识别滑块块里置信最高的换算
     if not hit:
-        pool = [g for g in gaps
-                if g.get('x') is not None and g.get('kind') != 'hole']
-        if not pool:
-            pool = [g for g in gaps if g.get('x') is not None]
+        pool = [g for g in gaps if g.get('x') is not None]
         best = max(pool, key=lambda g: g.get('conf') or 0.0)
         hit = {
             'x': int(best['x'] - (best.get('pad_x') or 0) + crop_x0),
@@ -1346,7 +1212,6 @@ def _find_gap_info_run(bg, block, extra=None):
     out = {
         'x': int(hit['x']),
         'y': int(hit.get('y') if hit.get('y') is not None else crop_y0),
-        'n_gaps': n_gaps,
         'gaps': gaps,
         'method': hit.get('method'),
         'conf': float(hit.get('conf') or 0.0),
@@ -1584,7 +1449,6 @@ def _write_meta(folder, prefix, info=None, group='', error=None):
         'group': group or prefix,
         'x': None if not ok else info.get('x'),
         'y': None if not ok else info.get('y'),
-        'n_gaps': None if not ok else info.get('n_gaps'),
         'method': None if not ok else info.get('method'),
         'conf': None if not ok else info.get('conf'),
         'pad_x': None if not ok else info.get('pad_x'),

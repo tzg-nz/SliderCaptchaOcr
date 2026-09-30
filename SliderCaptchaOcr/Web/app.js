@@ -188,7 +188,6 @@
     if (!item || !data) return;
     item.x = data.x;
     item.y = data.y;
-    item.n_gaps = data.n_gaps;
     item.conf = data.conf;
     item.pad_x = data.pad_x;
     item.ph = data.ph;
@@ -397,7 +396,6 @@
       : '';
     var chips = '<span class="chip dist">x=<b>' + esc(item.x == null ? '-' : item.x) + '</b></span>'
       + '<span class="chip xy">y=<b>' + esc(item.y == null ? '-' : item.y) + '</b></span>'
-      + chip('缺口', item.n_gaps == null ? '-' : item.n_gaps)
       + confChip(item.conf);
     return '<article class="card ' + cls + '" data-id="' + esc(item.id) + '" data-group="' + esc(item.group || item.id) + '">'
       + '<header>' + chips + traceTog + run + del + '</header>'
@@ -628,7 +626,7 @@
       if (role !== 'boxed') {
         item.boxed = null;
         item.error = null;
-        item.x = item.y = item.n_gaps = item.conf = item.pad_x = item.ph = item.sx = item.sy = item.tdist = null;
+        item.x = item.y = item.conf = item.pad_x = item.ph = item.sx = item.sy = item.tdist = null;
         dropTrace(traceKey(item));
       }
       render();
@@ -920,7 +918,7 @@
             return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
               + 'T' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
           })(),
-          x: null, y: null, n_gaps: null, conf: null,
+          x: null, y: null, conf: null,
           pad_x: null, ph: null, sx: null, sy: null, tdist: null,
           bg: null, slider: null, boxed: null, error: null
         });

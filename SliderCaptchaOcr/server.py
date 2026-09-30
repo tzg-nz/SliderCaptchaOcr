@@ -154,7 +154,6 @@ def list_cases():
             'created': meta.get('created') or '',
             'x': meta.get('x') if has_box else None,
             'y': meta.get('y') if has_box else None,
-            'n_gaps': meta.get('n_gaps') if has_box else None,
             'conf': meta.get('conf') if has_box else None,
             'pad_x': meta.get('pad_x') if has_box else None,
             'ph': meta.get('ph') if has_box else None,
@@ -180,7 +179,6 @@ def _info_to_payload(info, boxed_bytes):
     return {
         'x': None if not ok else info.get('x'),
         'y': None if not ok else info.get('y'),
-        'n_gaps': None if not ok else info.get('n_gaps'),
         'method': None if not ok else info.get('method'),
         'conf': None if not ok else info.get('conf'),
         'pad_x': None if not ok else info.get('pad_x'),
