@@ -6,14 +6,13 @@
   rim      滑块描边 × 背景亮边（白描边/浅色幽灵缺口）
   outline  alpha 描边对背景 Canny
   dark     剪影窗口平均亮度（只作参考，不投票）
-  ddddocr  可选兜底
   diff     若提供完整原图（第三张），与缺口背景做差找洞
   seam    轮廓阶跃 × 块内反差（锐利边界填充块，独一份门控）
   fill    块内反差旁证（与 seam 同图源）
 
 滑块按 alpha 连通域拆块，每块对齐一个缺口，滑动距离只用滑块块对齐的结果。
 
-投票：剪影 / 亮边 / 描边局部峰，两票以上 x/y 接近取均值；暗区和 ddddocr 不投票。
+投票：剪影 / 亮边 / 描边局部峰，两票以上 x/y 接近取均值；暗区不投票。
 置信过低返回 None，不乱猜。
 
     输入支持 bytes / base64 / dataURL / http(s) 图片地址 / 文件路径 / PIL.Image。
@@ -654,38 +653,6 @@ def _gap_rim_arr(bg, piece, y_lo=None, y_hi=None):
     return x, y, float(max_val)
 
 
-_dddd = None
-
-
-def _piece_png(piece):
-    from io import BytesIO
-    from PIL import Image
-    buf = BytesIO()
-    Image.fromarray(piece).save(buf, format='PNG')
-    return buf.getvalue()
-
-
-def _gap_ddddocr_arr(bg, piece, bg_bytes, y_lo=None, y_hi=None):
-    global _dddd
-    try:
-        import ddddocr
-        if _dddd is None:
-            _dddd = ddddocr.DdddOcr(det=False, ocr=False, show_ad=False)
-        target = _piece_png(piece)
-        res = _dddd.slide_match(target, bg_bytes, simple_target=True)
-        box = (res or {}).get('target') or []
-        if len(box) < 2:
-            return None, None, 0.0
-        x, y = int(box[0]), int(box[1]) if len(box) > 1 else 0
-        ph, pw = piece.shape[0], piece.shape[1]
-        gh, gw = bg.shape[0], bg.shape[1]
-        if not _in_range(x, y, gw, gh, pw, ph) or not _y_ok(y, y_lo, y_hi):
-            return None, None, 0.0
-        return x, y, 0.75
-    except Exception:
-        return None, None, 0.0
-
-
 def _gap_content_arr(bg, piece, y_lo=None, y_hi=None):
     """滑块内容对背景纹理：高通后按 alpha 掩码做归一化互相关。
 
@@ -972,8 +939,6 @@ def _n_lock(xs, x, y, tol=6, ytol=8):
         return 0
     n = 0
     for m, xx, yy, c in xs:
-        if 'dddd' in str(m):
-            continue
         if c is None or float(c) < 0.25:
             continue
         if abs(int(xx) - int(x)) <= tol and abs(int(yy) - int(y)) <= ytol:
@@ -982,9 +947,8 @@ def _n_lock(xs, x, y, tol=6, ytol=8):
 
 
 def _agree(xs, tol=6, ytol=8):
-    """xs: (method, x, y, conf)。x、y 都接近才算一票。暗区 / ddddocr 不投票。"""
-    pool = [(m, x, y, c) for m, x, y, c in xs
-            if 'dddd' not in str(m) and str(m) != 'dark']
+    """xs: (method, x, y, conf)。x、y 都接近才算一票。暗区不投票。"""
+    pool = [(m, x, y, c) for m, x, y, c in xs if str(m) != 'dark']
     if len(pool) < 2:
         return None
     for _m, xa, ya, _c in pool:
@@ -1026,8 +990,7 @@ def _pick_best(xs):
     """
     if not xs:
         return None
-    pool = [v for v in xs
-            if str(v[0]) != 'dark' and 'dddd' not in str(v[0])]
+    pool = [v for v in xs if str(v[0]) != 'dark']
     if not pool:
         pool = list(xs)
 
@@ -1082,7 +1045,7 @@ def _match_piece(bg, piece, bg_bytes=None, full=None, y_lo=None, y_hi=None):
         hit['cands'] = cands
         hit['w'] = int(piece.shape[1])
         hit['h'] = int(piece.shape[0])
-        shown = [t for t in xs if str(t[0]) not in ('dark',) and 'dddd' not in str(t[0])]
+        shown = [t for t in xs if str(t[0]) != 'dark']
         hit['conf'] = _lock_conf(hit.get('conf'), _n_lock(shown, hit.get('x'), hit.get('y')))
         return hit
     return {'x': None, 'y': None, 'method': None, 'conf': 0.0,
