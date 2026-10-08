@@ -47,7 +47,7 @@ body { min-height: 100vh; }
 .note[open] summary::before { content: '▾ '; }
 .note .note-body {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   margin: 10px 0 0;
   padding: 4px 0;
   background: #fff;
@@ -57,9 +57,6 @@ body { min-height: 100vh; }
 .note .note-body section {
   min-width: 0;
   padding: 20px 28px;
-}
-.note .note-body section:first-child {
-  border-right: 1px solid var(--line);
 }
 .note h3 {
   margin: 0 0 12px;
@@ -393,12 +390,7 @@ figure img {
   .wrap, .top { padding-left: 14px; padding-right: 14px; }
   .head { flex-direction: column; }
   .acts { justify-content: flex-start; }
-  .note .note-body { grid-template-columns: 1fr; padding: 4px 0; }
   .note .note-body section { padding: 14px 16px; }
-  .note .note-body section:first-child {
-    border-right: 0;
-    border-bottom: 1px solid var(--line);
-  }
   .trio { grid-template-columns: 1fr; grid-template-rows: none; }
   .cell { display: flex; flex-direction: column; gap: 8px; }
   .cell .lab, .cell figure { grid-row: auto; }
