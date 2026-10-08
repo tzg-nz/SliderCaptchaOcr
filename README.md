@@ -4,6 +4,7 @@
 并且可以生成对应可食用轨迹（基于贝赛尔曲线），以及支持本地html打开对比查看
 
 <img src='https://github.com/tzg-nz/SliderCaptchaOcr/blob/main/1.jpg'>
+
 ## 目录结构
 
 ```
